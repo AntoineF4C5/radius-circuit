@@ -1,0 +1,11 @@
+[package]
+name = "radius-circuit"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bellperson = { version = "0.25", default-features = false }
+ff = "0.13.0"
+nova-snark = { git = "https://github.com/argumentcomputer/Nova", branch = "solidity-verifier-pp-spartan" }
+pasta_curves = { version = "0.5", features = ["repr-c", "serde"] }
+serde_json = "1.0.133"
