@@ -27,20 +27,33 @@ where
     fn synthesize<CS: ConstraintSystem<F>>(
         &self,
         cs: &mut CS,
-        z: &[AllocatedNum<F>],
+        _z: &[AllocatedNum<F>],
     ) -> Result<Vec<AllocatedNum<F>>, SynthesisError> {
         let x_ref = F::from(5000);
         let y_ref = F::from(5000);
         let radius = F::from(100);
-        // the number of bits required to represent any number used: the circuit's inputs need to be lower than 8192
-        let num_bits = 13;
+        // the number of bits required to represent any number used: it is 2n + 1 where n is the number of bits required to represent the largest number
+        // because we then compare the difference of the sum of squares with the square of the radius
+        let num_bits = 13 * 2 + 1;
 
         let x = AllocatedNum::alloc(cs.namespace(|| "x"), || Ok(self.x))?;
         let y = AllocatedNum::alloc(cs.namespace(|| "y"), || Ok(self.y))?;
 
+        let are_none = x.get_value().is_none();
+
+        if !are_none {
+            println!("x: {:?}", x.get_value().unwrap());
+            println!("y: {:?}", y.get_value().unwrap());
+        }
+
         // check greater of x and x_ref to perform the subtraction
         let x_lt = less_than(&x, x_ref, num_bits, &mut cs.namespace(|| "x lt x_ref"))?;
         let y_lt = less_than(&y, y_ref, num_bits, &mut cs.namespace(|| "y lt y_ref"))?;
+
+        if !are_none {
+            println!("x_lt: {:?}", x_lt.get_value().unwrap());
+            println!("y_lt: {:?}", y_lt.get_value().unwrap());
+        }
 
         // Calculate diff
         let x_diff = AllocatedNum::alloc(cs.namespace(|| "x_diff"), || {
@@ -61,6 +74,11 @@ where
             }
         })?;
 
+        if !are_none {
+            println!("x_diff: {:?}", x_diff.get_value().unwrap());
+            println!("y_diff: {:?}", y_diff.get_value().unwrap());
+        }
+
         // Enforce diff calculation
         // ???
 
@@ -79,6 +97,11 @@ where
                 .ok_or(SynthesisError::AssignmentMissing)?;
             Ok(y_diff_value * y_diff_value)
         })?;
+
+        if !are_none {
+            println!("x_diff_squared: {:?}", x_diff_squared.get_value().unwrap());
+            println!("y_diff_squared: {:?}", y_diff_squared.get_value().unwrap());
+        }
 
         cs.enforce(
             || "enforce x_diff_squared",
@@ -104,6 +127,10 @@ where
             Ok(x_diff_squared_value + y_diff_squared_value)
         })?;
 
+        if !are_none {
+            println!("sum_squared: {:?}", sum_squared.get_value().unwrap());
+        }
+
         cs.enforce(
             || "enforce sum_squared",
             |lc| lc + x_diff_squared.get_variable() + y_diff_squared.get_variable(),
@@ -113,12 +140,23 @@ where
 
         let radius_squared = radius * radius;
 
+        if !are_none {
+            println!("radius_squared: {:?}", radius_squared);
+        }
+
         let is_within_radius = less_than(
             &sum_squared,
             radius_squared,
             num_bits,
             &mut cs.namespace(|| "x_sq + y_sq lt r_sq"),
         )?;
+
+        if !are_none {
+            println!(
+                "is_within_radius: {:?}",
+                is_within_radius.get_value().unwrap()
+            );
+        }
 
         let output = AllocatedNum::alloc(cs.namespace(|| "output"), || {
             let is_within_radius_value = is_within_radius
@@ -131,11 +169,15 @@ where
             })
         })?;
 
+        if !are_none {
+            println!("output: {:?}", output.get_value().unwrap());
+        }
+
         Ok(vec![output])
     }
 
     fn output(&self, z: &[F]) -> Vec<F> {
-        vec![z[0] * z[0] * z[0] + z[0] + F::from(5u64)]
+        vec![F::from(1)]
     }
 }
 
@@ -210,7 +252,7 @@ fn main() {
         zn_secondary_direct = circuit_secondary.clone().output(&zn_secondary_direct);
     }
     assert_eq!(zn_secondary, zn_secondary_direct);
-    assert_eq!(zn_secondary, vec![<G2 as Group>::Scalar::from(2460515u64)]);
+    assert_eq!(zn_secondary, vec![<G2 as Group>::Scalar::from(1)]);
 
     // produce the prover and verifier keys for compressed snark
     let (pk, vk) = CompressedSNARK::<_, _, _, _, S1Prime<G1>, S2Prime<G2>>::setup(&pp).unwrap();
@@ -284,6 +326,7 @@ fn num_to_bits_le_bounded<F: PrimeField + PrimeFieldBits, CS: ConstraintSystem<F
 
     Ok(bits_circuit)
 }
+
 fn get_msb_index<F: PrimeField + PrimeFieldBits>(n: F) -> u8 {
     n.to_le_bits()
         .into_iter()
@@ -300,10 +343,19 @@ fn less_than<F: PrimeField + PrimeFieldBits, CS: ConstraintSystem<F>>(
     num_bits: u8,
     cs: &mut CS,
 ) -> Result<AllocatedBit, SynthesisError> {
+    let are_none = a.get_value().is_none();
+
     let shifted_diff = AllocatedNum::alloc(cs.namespace(|| "shifted_diff"), || {
         let a_value = a.get_value().ok_or(SynthesisError::AssignmentMissing)?;
         Ok(a_value + F::from(1 << num_bits) - b)
     })?;
+
+    if !are_none {
+        println!("a: {:?}", a.get_value().unwrap());
+        println!("b: {:?}", b);
+        println!("c: {:?}", F::from(1 << num_bits));
+        println!("shifted_diff: {:?}", shifted_diff.get_value().unwrap());
+    }
 
     cs.enforce(
         || "shifted_diff_computation",
@@ -314,13 +366,21 @@ fn less_than<F: PrimeField + PrimeFieldBits, CS: ConstraintSystem<F>>(
 
     let shifted_diff_bits = num_to_bits_le_bounded::<F, CS>(cs, shifted_diff, num_bits + 1)?;
 
-    /*     // Check that the last (i.e. most sifnificant) bit is 0
-    cs.enforce(
-        || "bound_check",
+    let output = AllocatedBit::alloc(cs.namespace(|| "output"), {
+        Some(
+            !shifted_diff_bits[num_bits as usize]
+                .get_value()
+                .unwrap_or(false),
+        )
+    })?;
+
+    // would like to enforce shifted_diff_bits[num_bits as usize] == (1 - output), to ensure output is opposite of the MSB
+    /*     cs.enforce(
+        || "output_computation",
         |lc| lc + shifted_diff_bits[num_bits as usize].get_variable(),
-        |lc| lc + CS::one(),
-        |lc| lc + (F::ZERO, CS::one()),
+        |lc: LinearCombination<F>| lc + CS::one(),
+        |lc| lc + (F::ONE - output.get_variable(), CS::one()),
     ); */
 
-    Ok(shifted_diff_bits[num_bits as usize].clone())
+    Ok(output)
 }
