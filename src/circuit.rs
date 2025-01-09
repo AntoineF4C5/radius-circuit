@@ -1,9 +1,8 @@
-use bellperson::{
-    gadgets::{boolean::AllocatedBit, num::AllocatedNum},
-    ConstraintSystem, LinearCombination, SynthesisError,
+use bellpepper_core::{
+    boolean::AllocatedBit, num::AllocatedNum, ConstraintSystem, LinearCombination, SynthesisError,
 };
 use ff::{PrimeField, PrimeFieldBits};
-use nova_snark::traits::circuit::StepCircuit;
+use nova::traits::circuit::StepCircuit;
 
 #[derive(Clone, Debug, Default)]
 pub struct ProximityCircuit<F: PrimeField + PrimeFieldBits> {
@@ -23,6 +22,10 @@ where
 {
     fn arity(&self) -> usize {
         1
+    }
+
+    fn get_counter_type(&self) -> nova::StepCounterType {
+        nova::StepCounterType::Incremental
     }
 
     fn synthesize<CS: ConstraintSystem<F>>(
@@ -135,10 +138,6 @@ where
 
         Ok(vec![output])
     }
-
-    fn output(&self, _z: &[F]) -> Vec<F> {
-        vec![F::from(1)]
-    }
 }
 
 fn num_to_bits_le_bounded<F: PrimeField + PrimeFieldBits, CS: ConstraintSystem<F>>(
@@ -235,12 +234,14 @@ fn less_than<F: PrimeField + PrimeFieldBits, CS: ConstraintSystem<F>>(
 mod tests {
     use crate::circuit::ProximityCircuit;
     use ff::Field;
-    use nova_snark::traits::{
-        circuit::{StepCircuit, TrivialTestCircuit},
-        Group,
+    use nova::{provider, spartan};
+    use nova::{
+        provider::PallasEngine,
+        traits::{
+            circuit::TrivialCircuit, snark::RelaxedR1CSSNARKTrait, CurveCycleEquipped, Group,
+        },
     };
-    use nova_snark::{provider, spartan};
-    use nova_snark::{CompressedSNARK, PublicParams, RecursiveSNARK};
+    use nova::{CompressedSNARK, PublicParams, RecursiveSNARK};
     #[test]
     fn test_all() {
         let generate_keys_to_json = true;
@@ -254,44 +255,35 @@ mod tests {
         type S1Prime<G1> = spartan::ppsnark::RelaxedR1CSSNARK<G1, EE1<G1>>;
         type S2Prime<G2> = spartan::ppsnark::RelaxedR1CSSNARK<G2, EE2<G2>>;
 
-        let circuit_primary = TrivialTestCircuit::default();
+        let circuit_primary = TrivialCircuit::default();
         let circuit_secondary = ProximityCircuit {
             x: <G2 as Group>::Scalar::from(5001u64),
             y: <G2 as Group>::Scalar::from(5001u64),
         };
 
         // produce public parameters
-        let pp = PublicParams::<
-            G1,
-            G2,
-            TrivialTestCircuit<<G1 as Group>::Scalar>,
-            ProximityCircuit<<G2 as Group>::Scalar>,
-        >::setup(circuit_primary.clone(), circuit_secondary.clone());
+        let pp = PublicParams::<provider::PallasEngine>::setup(
+            &circuit_primary.clone(),
+            &circuit_secondary.clone(),
+            &*S1Prime::ck_floor(),
+            &*S2Prime::ck_floor(),
+        )
+        .unwrap();
 
         let num_steps = 1;
 
         // produce a recursive SNARK
-        let mut recursive_snark = RecursiveSNARK::<
-            G1,
-            G2,
-            TrivialTestCircuit<<G1 as Group>::Scalar>,
-            ProximityCircuit<<G2 as Group>::Scalar>,
-        >::new(
+        let mut recursive_snark = RecursiveSNARK::<provider::PallasEngine>::new(
             &pp,
             &circuit_primary,
             &circuit_secondary,
-            vec![<G1 as Group>::Scalar::ONE],
-            vec![<G2 as Group>::Scalar::ZERO],
-        );
+            &[<G1 as Group>::Scalar::ONE],
+            &[<G2 as Group>::Scalar::ZERO],
+        )
+        .unwrap();
 
         for _i in 0..num_steps {
-            let res = recursive_snark.prove_step(
-                &pp,
-                &circuit_primary,
-                &circuit_secondary,
-                vec![<G1 as Group>::Scalar::ONE],
-                vec![<G2 as Group>::Scalar::ZERO],
-            );
+            let res = recursive_snark.prove_step(&pp, &circuit_primary, &circuit_secondary);
             assert!(res.is_ok());
         }
 
@@ -304,19 +296,18 @@ mod tests {
         );
         assert!(res.is_ok());
 
-        let (zn_primary, zn_secondary) = res.unwrap();
+        let (zn_primary, _) = res.unwrap();
 
         // sanity: check the claimed output with a direct computation of the same
         assert_eq!(zn_primary, vec![<G1 as Group>::Scalar::ONE]);
-        let mut zn_secondary_direct = vec![<G2 as Group>::Scalar::ZERO];
-        for _i in 0..num_steps {
-            zn_secondary_direct = circuit_secondary.clone().output(&zn_secondary_direct);
-        }
-        assert_eq!(zn_secondary, zn_secondary_direct);
-        assert_eq!(zn_secondary, vec![<G2 as Group>::Scalar::from(1)]);
 
         // produce the prover and verifier keys for compressed snark
-        let (pk, vk) = CompressedSNARK::<_, _, _, _, S1Prime<G1>, S2Prime<G2>>::setup(&pp).unwrap();
+        let (pk, vk) = CompressedSNARK::<
+            provider::PallasEngine,
+            S1Prime<PallasEngine>,
+            S2Prime<<PallasEngine as CurveCycleEquipped>::Secondary>,
+        >::setup(&pp)
+        .unwrap();
 
         if generate_keys_to_json {
             let serialized_vk = serde_json::to_string(&vk).unwrap();
@@ -324,11 +315,7 @@ mod tests {
                 .expect("Unable to write file");
         }
         // produce a compressed SNARK
-        let res = CompressedSNARK::<_, _, _, _, S1Prime<G1>, S2Prime<G2>>::prove(
-            &pp,
-            &pk,
-            &recursive_snark,
-        );
+        let res = CompressedSNARK::prove(&pp, &pk, &recursive_snark);
         assert!(res.is_ok());
         let compressed_snark = res.unwrap();
 
@@ -344,8 +331,8 @@ mod tests {
         let res = compressed_snark.verify(
             &vk,
             num_steps,
-            vec![<G1 as Group>::Scalar::ONE],
-            vec![<G2 as Group>::Scalar::ZERO],
+            &[<G1 as Group>::Scalar::ONE],
+            &[<G2 as Group>::Scalar::ZERO],
         );
         assert!(res.is_ok());
     }
